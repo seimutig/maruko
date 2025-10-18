@@ -45,6 +45,24 @@ public class TableStoreDynamicTableFactory implements DynamicTableSourceFactory,
             .defaultValue(4)
             .withDescription("Number of buckets for data distribution");
 
+    public static final ConfigOption<String> OSS_ACCESS_KEY_ID = ConfigOptions
+            .key("oss.accessKeyId")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("OSS Access Key ID");
+
+    public static final ConfigOption<String> OSS_ACCESS_KEY_SECRET = ConfigOptions
+            .key("oss.accessKeySecret")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("OSS Access Key Secret");
+
+    public static final ConfigOption<String> OSS_ENDPOINT = ConfigOptions
+            .key("oss.endpoint")
+            .stringType()
+            .defaultValue("oss-cn-hangzhou.aliyuncs.com")
+            .withDescription("OSS Endpoint");
+
     
 
     @Override
@@ -65,6 +83,9 @@ public class TableStoreDynamicTableFactory implements DynamicTableSourceFactory,
         options.add(PRIMARY_KEYS);
         options.add(PARTITION_KEYS);
         options.add(NUM_BUCKETS);
+        options.add(OSS_ACCESS_KEY_ID);
+        options.add(OSS_ACCESS_KEY_SECRET);
+        options.add(OSS_ENDPOINT);
         return options;
     }
 

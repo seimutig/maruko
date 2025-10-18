@@ -1,7 +1,7 @@
 package org.example.tablestore.lsm;
 
 import org.example.tablestore.format.ManifestEntry;
-import org.example.tablestore.io.FileStore;
+import org.example.tablestore.io.IFileStore;
 
 import java.io.IOException;
 import java.util.*;
@@ -22,7 +22,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class LSMTree {
     private final String tablePath;
-    private final FileStore fileStore;
+    private final IFileStore fileStore;
     private final LSMTreeConfig config;
     
     // Levels of the LSM tree
@@ -34,7 +34,7 @@ public class LSMTree {
     // Sequence generator for file IDs
     private final AtomicLong fileIdGenerator = new AtomicLong(System.currentTimeMillis());
     
-    public LSMTree(String tablePath, FileStore fileStore, LSMTreeConfig config) {
+    public LSMTree(String tablePath, IFileStore fileStore, LSMTreeConfig config) {
         this.tablePath = tablePath;
         this.fileStore = fileStore;
         this.config = config != null ? config : LSMTreeConfig.getDefault();
@@ -180,12 +180,21 @@ public class LSMTree {
         for (int i = 0; i < fileGroups.size(); i++) {
             List<MergedRecord> group = fileGroups.get(i);
             
-            // Create a temporary file path for the compacted data
-            String compactedFilePath = tablePath + "/compacted_" + System.currentTimeMillis() + "_" + i + ".data";
+            // Convert MergedRecord objects to Map objects for writing
+            List<Map<String, Object>> recordsToWrite = new ArrayList<>();
+            for (MergedRecord mergedRecord : group) {
+                recordsToWrite.add(mergedRecord.getRecord());
+            }
             
-            // In a real implementation, we would actually write the compacted data
-            // For this demo, we'll simulate writing
-            long fileSize = simulateWriteRecords(group, compactedFilePath);
+            // Create a temporary file path for the compacted data
+            // For compaction, we'll use a special partition path
+            Map<String, String> partitionSpec = new HashMap<>();
+            partitionSpec.put("_compacted", "level_" + levelOfFiles(inputFiles));
+            
+            // Write actual compacted data using FileStore
+            String compactedFilePath = writeCompactedData(recordsToWrite, partitionSpec, 0);
+            
+            long fileSize = recordsToWrite.size() * 1024; // Approximate size
             
             ManifestEntry compactedEntry = new ManifestEntry(
                 ManifestEntry.ADD,
@@ -204,6 +213,18 @@ public class LSMTree {
         System.out.println("Compaction completed: " + inputFiles.size() + " input files -> " + result.size() + " output files");
         
         return result;
+    }
+    
+    /**
+     * Write compacted data to file system using the FileStore
+     * This is used during compaction to create actual files
+     */
+    private String writeCompactedData(List<Map<String, Object>> records, Map<String, String> partitionSpec, int bucket) 
+            throws IOException {
+        // Use the FileStore to write the actual data
+        String filePath = fileStore.writeData(records, partitionSpec, bucket);
+        System.out.println("Actually wrote " + records.size() + " compacted records to " + filePath);
+        return filePath;
     }
     
     /**
@@ -426,12 +447,7 @@ public class LSMTree {
      * Simulate writing records to a file
      * In a real implementation, this would actually write Parquet/ORC files
      */
-    private long simulateWriteRecords(List<MergedRecord> records, String filePath) {
-        // Simulate file size based on number of records
-        long estimatedSize = records.size() * 1024; // 1KB per record approximation
-        System.out.println("Simulated writing " + records.size() + " records to " + filePath + " (" + estimatedSize + " bytes)");
-        return estimatedSize;
-    }
+    
     
     /** 
      * Get statistics about the LSM tree

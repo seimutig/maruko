@@ -5,7 +5,7 @@ import org.example.tablestore.format.Snapshot;
 import org.example.tablestore.format.ManifestEntry;
 import org.example.tablestore.format.ManifestManager;
 import org.example.tablestore.format.SnapshotManager;
-import org.example.tablestore.io.FileStore;
+import org.example.tablestore.io.IFileStore;
 import org.example.tablestore.lsm.LSMTree;
 import org.example.tablestore.lsm.LSMTreeConfig;
 
@@ -21,9 +21,13 @@ import java.util.HashMap;
 import java.util.Set;
 import java.util.HashSet;
 
+import org.example.tablestore.io.OSSCompatibleFileStore;
+import org.example.tablestore.core.StreamChangeRecord;
+import org.example.tablestore.core.StreamChangeType;
+
 public class TableStore {
     private final String tablePath;
-    private final FileStore fileStore;
+    private final IFileStore fileStore;
     private final SnapshotManager snapshotManager;
     private final ManifestManager manifestManager;
     private final MergeOnReadManager mergeManager;
@@ -35,21 +39,30 @@ public class TableStore {
     private final ReentrantReadWriteLock tableLock = new ReentrantReadWriteLock();
     private volatile boolean isClosed = false;
     
+    // Write buffer for accumulating records before flushing to disk
+    private final List<Map<String, Object>> writeBuffer = new CopyOnWriteArrayList<>();
+    private final Object bufferLock = new Object();
+    private volatile long currentBufferSizeBytes = 0;
+    private static final long TARGET_BUFFER_SIZE_BYTES = 64 * 1024 * 1024; // 64MB default target file size
+    private volatile long lastFlushTimestamp = System.currentTimeMillis();
+    private static final long MAX_FLUSH_INTERVAL_MS = 30 * 1000; // 30 seconds max interval
+    
     // Fields for streaming functionality
     private volatile long lastReadSnapshotId = -1;
     private final List<TableStoreChangeListener> changeListeners = new CopyOnWriteArrayList<>();
     
-    // Store for tracking the current state to detect changes in real-time
-    private volatile Map<String, Map<String, Object>> currentState = new ConcurrentHashMap<>();
+    // In-memory state tracking for real-time operations
+    private final Map<String, Map<String, Object>> currentState = new ConcurrentHashMap<>();
     private final Object stateUpdateLock = new Object();
-    
-    // Changelog stored as simple append-only log file
-    private final String changelogDir;
-    private final String changelogFilePath;
-    private volatile long lastProcessedChangelogId = 0;  // Track which changes have been consumed by streaming reader
 
     public TableStore(String tablePath, List<String> primaryKeyFields, List<String> partitionFields, 
                      int numBuckets, org.apache.parquet.schema.MessageType schema) throws IOException {
+        this(tablePath, primaryKeyFields, partitionFields, numBuckets, schema, null); // Call the new constructor with null options
+    }
+    
+    public TableStore(String tablePath, List<String> primaryKeyFields, List<String> partitionFields, 
+                     int numBuckets, org.apache.parquet.schema.MessageType schema, 
+                     Map<String, String> options) throws IOException {
         // Validate inputs
         if (tablePath == null || tablePath.trim().isEmpty()) {
             throw new IllegalArgumentException("Table path cannot be null or empty");
@@ -67,7 +80,7 @@ public class TableStore {
         this.bucketAssigner = new BucketAssigner(numBuckets);
         
         // Initialize core components
-        this.fileStore = new FileStore(tablePath, schema);
+        this.fileStore = new OSSCompatibleFileStore(tablePath, schema, options);
         this.snapshotManager = new SnapshotManager(tablePath, fileStore.getFileSystem());
         this.manifestManager = new ManifestManager(tablePath, fileStore.getFileSystem());
         this.mergeManager = new MergeOnReadManager(fileStore, primaryKeyFields);
@@ -76,10 +89,6 @@ public class TableStore {
         // Initialize LSM tree with default configuration
         LSMTreeConfig lsmConfig = LSMTreeConfig.getDefault();
         this.lsmTree = new LSMTree(tablePath, fileStore, lsmConfig);
-        
-        // Initialize changelog directory and file
-        this.changelogDir = tablePath + "/changelog";
-        this.changelogFilePath = changelogDir + "/changelog.log";
         
         // Initialize last read snapshot ID and load initial state
         try {
@@ -105,10 +114,11 @@ public class TableStore {
         }
     }
 
-    /**
-     * Writes records to the table with proper partitioning and bucketing
-     * Uses LSM-tree for file organization
-     * Determines operation type (INSERT/UPDATE) in real-time and adds to persistent changelog
+    /** 
+     * Accumulates records in write buffer for efficient batching
+     * Flushes to disk when buffer reaches target size or based on time-based policy
+     * Uses LSM-tree for file organization with proper buffering
+     * Determines operation type (INSERT/UPDATE) in real-time for primary key deduplication
      */
     public void write(List<Map<String, Object>> records) throws IOException {
         if (isClosed) {
@@ -123,50 +133,102 @@ public class TableStore {
             // Validate records
             validateRecords(records);
             
-            // Process each record to determine operation type and add to persistent changelog
-            for (Map<String, Object> record : records) {
-                String primaryKeyValue = null;
-                if (!primaryKeyFields.isEmpty() && record.containsKey(primaryKeyFields.get(0))) {
-                    primaryKeyValue = record.get(primaryKeyFields.get(0)).toString();
-                }
-                
-                if (primaryKeyValue != null) {
-                    // Use in-memory current state to check if record already exists (much more efficient than reading snapshot)
-                    Map<String, Object> existingRecord = currentState.get(primaryKeyValue);
+            // Add records to write buffer for efficient batching
+            synchronized (bufferLock) {
+                for (Map<String, Object> record : records) {
+                    // Estimate record size (simplified estimation)
+                    long recordSize = estimateRecordSize(record);
+                    writeBuffer.add(new HashMap<>(record)); // Deep copy to avoid external mutations
+                    currentBufferSizeBytes += recordSize;
                     
-                    if (existingRecord != null) {
-                        // This is an UPDATE operation
-                        ChangeRecord updateRecord = new ChangeRecord(ChangeType.UPDATE, record, existingRecord);
-                        appendToChangelog(updateRecord);
-                        System.out.println("Persistent Changelog: Detected UPDATE for key " + primaryKeyValue);
-                        
-                        // Update the in-memory state
-                        synchronized (stateUpdateLock) {
-                            currentState.put(primaryKeyValue, new HashMap<>(record));
-                        }
-                    } else {
-                        // This is an INSERT operation
-                        ChangeRecord insertRecord = new ChangeRecord(ChangeType.INSERT, record, null);
-                        appendToChangelog(insertRecord);
-                        System.out.println("Persistent Changelog: Detected INSERT for key " + primaryKeyValue);
-                        
-                        // Update the in-memory state
+                    // Update in-memory state for deduplication
+                    String primaryKeyValue = null;
+                    if (!primaryKeyFields.isEmpty() && record.containsKey(primaryKeyFields.get(0))) {
+                        primaryKeyValue = record.get(primaryKeyFields.get(0)).toString();
+                    }
+                    
+                    if (primaryKeyValue != null) {
                         synchronized (stateUpdateLock) {
                             currentState.put(primaryKeyValue, new HashMap<>(record));
                         }
                     }
-                } else {
-                    // If no primary key, treat as INSERT
-                    ChangeRecord insertRecord = new ChangeRecord(ChangeType.INSERT, record, null);
-                    appendToChangelog(insertRecord);
-                    System.out.println("Persistent Changelog: Detected INSERT (no primary key)");
+                }
+                
+                // Check if we should flush the buffer
+                if (shouldFlushBuffer()) {
+                    flushWriteBuffer();
                 }
             }
             
-            // Group records by partition and bucket for storage in LSM tree
-            Map<PartitionBucketKey, List<Map<String, Object>>> groupedRecords = groupRecordsByPartitionBucket(records);
+            // Notify change listeners that new data has been buffered
+            notifyChangeListeners(records);
             
-            // Write each group to appropriate partition and bucket (for storage)
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Estimates the size of a record in bytes (simplified implementation)
+     */
+    private long estimateRecordSize(Map<String, Object> record) {
+        if (record == null) return 0;
+        
+        long size = 0;
+        for (Map.Entry<String, Object> entry : record.entrySet()) {
+            size += entry.getKey().length(); // Field name size
+            Object value = entry.getValue();
+            if (value != null) {
+                // Rough estimation of value size
+                if (value instanceof String) {
+                    size += ((String) value).length();
+                } else if (value instanceof Number) {
+                    size += 8; // Assume 8 bytes for numbers
+                } else {
+                    size += value.toString().length(); // Fallback to string representation
+                }
+            }
+        }
+        return size;
+    }
+    
+    /**
+     * Determines if the write buffer should be flushed based on size or time policies
+     */
+    private boolean shouldFlushBuffer() {
+        // Flush if buffer reaches target size
+        if (currentBufferSizeBytes >= TARGET_BUFFER_SIZE_BYTES) {
+            return true;
+        }
+        
+        // Flush if enough time has passed (time-based flushing)
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastFlushTimestamp >= MAX_FLUSH_INTERVAL_MS) {
+            return !writeBuffer.isEmpty(); // Only flush if there's data
+        }
+        
+        // Don't flush yet
+        return false;
+    }
+    
+    /**
+     * Flushes the accumulated write buffer to disk as properly sized files
+     * This is the core optimization - creating substantial files instead of tiny ones
+     */
+    private void flushWriteBuffer() throws IOException {
+        if (writeBuffer.isEmpty()) {
+            return; // Nothing to flush
+        }
+        
+        System.out.println("Flushing write buffer with " + writeBuffer.size() + " records (" + 
+                         (currentBufferSizeBytes / (1024 * 1024)) + " MB) to disk");
+        
+        try {
+            // Group buffered records by partition and bucket for storage in LSM tree
+            Map<PartitionBucketKey, List<Map<String, Object>>> groupedRecords = 
+                groupRecordsByPartitionBucket(writeBuffer);
+            
+            // Write each group to appropriate partition and bucket with proper file sizing
             for (Map.Entry<PartitionBucketKey, List<Map<String, Object>>> entry : groupedRecords.entrySet()) {
                 PartitionBucketKey key = entry.getKey();
                 List<Map<String, Object>> recordsForBucket = entry.getValue();
@@ -177,7 +239,7 @@ public class TableStore {
                     record.put("_sequence_number", sequenceNumber++);
                 }
                 
-                // Get the actual file path returned by writeData
+                // Get the actual file path returned by writeData (creates properly sized files)
                 String actualFilePath = fileStore.writeData(recordsForBucket, key.getPartitionSpec(), key.getBucket());
                 
                 // Create manifest entry for the file created by FileStore
@@ -192,22 +254,26 @@ public class TableStore {
                     recordsForBucket.size() // row count
                 );
                 
-                // Add file to LSM tree (level 0)
+                // Add file to LSM tree (level 0) - this represents the write path optimization
                 lsmTree.addFile(manifestEntry);
             }
             
-            // Notify change listeners that new data has been written
-            // NOTE: We don't create snapshots on every write anymore for production efficiency
-            // Snapshots will be created based on Flink checkpoints instead
-            notifyChangeListeners(records);
+            // Clear the buffer after successful flush
+            writeBuffer.clear();
+            currentBufferSizeBytes = 0;
+            lastFlushTimestamp = System.currentTimeMillis();
             
-        } finally {
-            tableLock.writeLock().unlock();
+            System.out.println("Write buffer flushed successfully to LSM tree");
+            
+        } catch (Exception e) {
+            System.err.println("Error flushing write buffer: " + e.getMessage());
+            throw new IOException("Failed to flush write buffer", e);
         }
     }
     
     /** 
      * Creates snapshot based on checkpoint - this should be called during Flink checkpointing
+     * Flushes any pending write buffer to ensure data consistency
      * Clears the real-time changelog as operations are already tracked in real-time
      */
     public void checkpoint() throws IOException {
@@ -219,15 +285,31 @@ public class TableStore {
         try {
             System.out.println("Creating snapshot during checkpoint...");
             
+            // IMPORTANT: Flush any pending writes to ensure checkpoint consistency
+            flushPendingWrites();
+            
             // Create the actual snapshot with current data
             createSnapshotAndManifest();
             
-            // In the real-time changelog model, operations are already tracked when they happen
-            // We could optionally clear the changelog buffer after a checkpoint if needed
-            // But typically in real-time changelog systems, the changelog persists for readers
+            // For sink tables, operations are already applied during write
+            // Snapshots are created for consistent reads and checkpointing
             
         } finally {
             tableLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Flushes any pending writes to ensure data consistency
+     * This is critical for checkpointing and data durability
+     */
+    private void flushPendingWrites() throws IOException {
+        synchronized (bufferLock) {
+            // Flush write buffer if it contains any data
+            if (!writeBuffer.isEmpty()) {
+                System.out.println("Flushing pending writes (" + writeBuffer.size() + " records) during checkpoint");
+                flushWriteBuffer();
+            }
         }
     }
     
@@ -323,51 +405,15 @@ public class TableStore {
         }
     }
     
-    /**
-     * Reads new change records from the persistent changelog file since last call
-     * Returns records with change type information (INSERT, UPDATE, DELETE)
-     * Provides real-time changelog operations from persistent storage, without duplicates
-     */
-    public List<ChangeRecord> readChangeRecords() throws IOException {
-        if (isClosed) {
-            throw new IllegalStateException("TableStore is closed");
-        }
-        
-        tableLock.readLock().lock();
-        try {
-            // Check if we have a snapshot or not
-            Snapshot latestSnapshot = snapshotManager.getLatestSnapshot();
-            if (latestSnapshot == null) {
-                // No checkpoint has been performed yet, return new changelog operations from persistent file
-                System.out.println("No snapshot exists yet, reading new changelog records from persistent file since position " + 
-                                 lastProcessedChangelogId);
-                
-                // Read new records from the persistent changelog file since last processed position
-                List<ChangeRecord> recordsToReturn = readNewChangelogRecords(lastProcessedChangelogId);
-                
-                // Update the last processed position to prevent duplicates
-                long newPosition = getChangelogPosition();
-                lastProcessedChangelogId = newPosition;
-                
-                System.out.println("Returning " + recordsToReturn.size() + " new persistent changelog operations (no checkpoint yet)");
-                return recordsToReturn;
+    private String buildPartitionPath(Map<String, String> partitionSpec) {
+        StringBuilder path = new StringBuilder();
+        for (Map.Entry<String, String> entry : partitionSpec.entrySet()) {
+            if (path.length() > 0) {
+                path.append("/");
             }
-            
-            System.out.println("Reading new changelog records from persistent file since position " + lastProcessedChangelogId);
-            
-            // Read new records from the persistent changelog file since last processed position
-            List<ChangeRecord> recordsToReturn = readNewChangelogRecords(lastProcessedChangelogId);
-            
-            // Update the last processed position to prevent duplicates
-            long newPosition = getChangelogPosition();
-            lastProcessedChangelogId = newPosition;
-            
-            System.out.println("Returning " + recordsToReturn.size() + " new persistent changelog operations");
-            return recordsToReturn;
-            
-        } finally {
-            tableLock.readLock().unlock();
+            path.append(entry.getKey()).append("=").append(entry.getValue());
         }
+        return path.length() > 0 ? path.toString() : "default";
     }
     
     /**
@@ -410,23 +456,7 @@ public class TableStore {
         return keyFields;
     }
     
-    /**
-     * Reads only new records since the last read operation (preserving backward compatibility)
-     * Returns all new records without considering change types
-     */
-    public List<Map<String, Object>> readNewChanges() throws IOException {
-        List<ChangeRecord> changeRecords = readChangeRecords();
-        List<Map<String, Object>> newRecords = new ArrayList<>();
-        
-        for (ChangeRecord changeRecord : changeRecords) {
-            if (changeRecord.getNewValue() != null) {
-                // Add the new values to the output
-                newRecords.add(changeRecord.getNewValue());
-            }
-        }
-        
-        return newRecords;
-    }
+    
     
     /**
      * Performs compaction on the table using LSM-tree
@@ -519,7 +549,7 @@ public class TableStore {
         return tablePath;
     }
 
-    public FileStore getFileStore() {
+    public IFileStore getFileStore() {
         return fileStore;
     }
 
@@ -554,15 +584,40 @@ public class TableStore {
     }
     
     /**
-     * Closes resources used by this TableStore
+     * Closes the TableStore and releases all resources
+     * Ensures any pending writes are flushed before closing
      */
-    public void close() {
+    public void close() throws IOException {
+        if (isClosed) {
+            return; // Already closed
+        }
+        
         tableLock.writeLock().lock();
         try {
-            if (isClosed) return;
+            System.out.println("Closing TableStore: " + tablePath);
+            
+            // Flush any pending writes to ensure data durability
+            flushPendingWrites();
+            
+            // Close all managers and clean up resources
+            if (snapshotManager != null) {
+                // Snapshot manager doesn't need explicit closing in this implementation
+            }
+            if (manifestManager != null) {
+                // Manifest manager doesn't need explicit closing in this implementation  
+            }
+            if (fileStore != null && fileStore instanceof AutoCloseable) {
+                try {
+                    ((AutoCloseable) fileStore).close();
+                } catch (Exception e) {
+                    System.err.println("Warning: Error closing file store: " + e.getMessage());
+                }
+            }
+            
+            // Mark as closed
             isClosed = true;
-            // In a real implementation, we'd close all resources here
-            System.out.println("TableStore closed: " + tablePath);
+            System.out.println("TableStore closed successfully: " + tablePath);
+            
         } finally {
             tableLock.writeLock().unlock();
         }
@@ -645,119 +700,210 @@ public class TableStore {
         }
         return null;
     }
-    
-    /**
-     * Appends a change record to the persistent changelog file
-     */
-    private void appendToChangelog(ChangeRecord changeRecord) throws IOException {
-        // Create changelog directory if it doesn't exist
-        java.nio.file.Path changelogPath = java.nio.file.Paths.get(changelogDir);
-        java.nio.file.Files.createDirectories(changelogPath);
-        
-        // Write the change record to the changelog file
-        java.nio.file.Path logPath = java.nio.file.Paths.get(changelogFilePath);
-        
-        // Serialize the change record to JSON and append to file
-        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-        String jsonLine = mapper.writeValueAsString(changeRecord) + \"\\n\";
-        String jsonLine = mapper.writeValueAsString(changeRecord) + "\n";
-        // Append to file using NIO
-        java.nio.file.Files.write(logPath, jsonLine.getBytes(\"UTF-8\"), 
-        java.nio.file.Files.write(logPath, jsonLine.getBytes("UTF-8"),
-                                 java.nio.file.StandardOpenOption.APPEND);
-    }
-    
-    /**
-     * Reads new change records from the persistent changelog file since last read position
-     */
-    private List<ChangeRecord> readNewChangelogRecords(long startPosition) throws IOException {
-        java.nio.file.Path logPath = java.nio.file.Paths.get(changelogFilePath);
-        
-        if (!java.nio.file.Files.exists(logPath)) {
-            return new ArrayList<>(); // No changelog file exists yet
-        }
-        
-        // Read all lines from the changelog file
-        List<String> allLines = java.nio.file.Files.readAllLines(logPath);
-        List<ChangeRecord> newRecords = new ArrayList<>();
-        
-        // Process lines starting from the specified position
-        for (int i = (int)startPosition; i < allLines.size(); i++) {
-            String line = allLines.get(i);
-            if (line.trim().isEmpty()) continue;
-            
-            try {
-                // Deserialize the JSON line back to ChangeRecord
-                com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-                ChangeRecord record = mapper.readValue(line, ChangeRecord.class);
-                newRecords.add(record);
-            } catch (Exception e) {
-                System.err.println(\"Error parsing changelog line: \" + line + \", error: \" + e.getMessage());
-            }
-        }
-        
-        return newRecords;
-    }
-    
-    /**
-     * Gets the current size/position of the changelog file
-     */
-    private long getChangelogPosition() throws IOException {
-        java.nio.file.Path logPath = java.nio.file.Paths.get(changelogFilePath);
-        
-        if (!java.nio.file.Files.exists(logPath)) {
-            return 0;
-        }
-        
-        // Just return the number of lines as the position
-        List<String> allLines = java.nio.file.Files.readAllLines(logPath);
-        return allLines.size();
-    }
-    
-    private String buildPartitionPath(Map<String, String> partitionSpec) {
-        StringBuilder path = new StringBuilder();
-        for (Map.Entry<String, String> entry : partitionSpec.entrySet()) {
-            if (path.length() > 0) {
-                path.append(\"/\");
-            }
-            path.append(entry.getKey()).append(\"=\").append(entry.getValue());
-        }
-        return path.length() > 0 ? path.toString() : \"default\";
-    }
-    
-    /**
-     * Change record to track type of data change
-     */
-    public static class ChangeRecord {
-        private final ChangeType changeType;
-        private final Map<String, Object> newValue;  // For INSERT/UPDATE
-        private final Map<String, Object> oldValue;  // For UPDATE/DELETE
-        
-        public ChangeRecord(ChangeType changeType, Map<String, Object> newValue, Map<String, Object> oldValue) {
-            this.changeType = changeType;
-            this.newValue = newValue;
-            this.oldValue = oldValue;
-        }
-        
-        public ChangeType getChangeType() {
-            return changeType;
-        }
-        
-        public Map<String, Object> getNewValue() {
-            return newValue;
-        }
-        
-        public Map<String, Object> getOldValue() {
-            return oldValue;
-        }
-    }
-    
-    /**
+
+    /** 
      * Enum for different types of changes
      */
     public enum ChangeType {
         INSERT,
         UPDATE,
         DELETE
+    }
+    
+    /**
+     * Gets the initial full snapshot for streaming mode
+     * This reads the complete latest snapshot as +I records for stream initialization
+     */
+    public List<Map<String, Object>> getInitialFullSnapshot() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.readLock().lock();
+        try {
+            System.out.println("Getting initial full snapshot for streaming initialization...");
+            
+            // Get the latest snapshot as the baseline
+            Snapshot latestSnapshot = snapshotManager.getLatestSnapshot();
+            
+            if (latestSnapshot == null) {
+                System.out.println("No snapshots found for initial streaming state, returning empty result");
+                return new ArrayList<>();
+            }
+            
+            System.out.println("Reading initial full snapshot ID: " + latestSnapshot.getId());
+            
+            // Read manifest entries from the snapshot's manifest list
+            List<ManifestEntry> manifestEntries = manifestManager.readManifestFile(latestSnapshot.getManifestList());
+            
+            // Apply merge-on-read deduplication to get current state
+            List<Map<String, Object>> currentFullState = mergeManager.readWithMerge(manifestEntries);
+            
+            // Update the last read snapshot ID to track where we are for changelog computation
+            this.lastReadSnapshotId = latestSnapshot.getId();
+            
+            System.out.println("Initial full snapshot contains " + currentFullState.size() + " records");
+            
+            return currentFullState;
+        } finally {
+            tableLock.readLock().unlock();
+        }
+    }
+    
+    /**
+     * Computes changelog between two snapshots for streaming mode
+     * Compares previous snapshot with current latest snapshot to determine +I, -U, +U, -D operations
+     */
+    public List<StreamChangeRecord> computeChangelogSinceLastRead() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.readLock().lock();
+        try {
+            System.out.println("Computing changelog since last read snapshot ID: " + lastReadSnapshotId);
+            
+            // Get all snapshots after the last read ID
+            List<Snapshot> snapshotsAfterLastRead = snapshotManager.getSnapshotsAfterId(lastReadSnapshotId);
+            
+            if (snapshotsAfterLastRead.isEmpty()) {
+                System.out.println("No new snapshots found since ID: " + lastReadSnapshotId);
+                return new ArrayList<>();
+            }
+            
+            // Process each new snapshot in order to compute cumulative changelog
+            List<StreamChangeRecord> allChanges = new ArrayList<>();
+            long currentTrackingId = lastReadSnapshotId;
+            
+            for (Snapshot newSnapshot : snapshotsAfterLastRead) {
+                System.out.println("Processing snapshot ID: " + newSnapshot.getId() + " (previous was: " + currentTrackingId + ")");
+                
+                // Get the previous snapshot state (could be null for first snapshot)
+                List<Map<String, Object>> previousState = new ArrayList<>();
+                if (currentTrackingId > 0) {
+                    Snapshot previousSnapshot = getSnapshotById(currentTrackingId);
+                    if (previousSnapshot != null) {
+                        List<ManifestEntry> prevManifestEntries = manifestManager.readManifestFile(previousSnapshot.getManifestList());
+                        previousState = mergeManager.readWithMerge(prevManifestEntries);
+                    }
+                }
+                
+                // Get the new snapshot state
+                List<ManifestEntry> newManifestEntries = manifestManager.readManifestFile(newSnapshot.getManifestList());
+                List<Map<String, Object>> newState = mergeManager.readWithMerge(newManifestEntries);
+                
+                // Compute changelog between previous and new state
+                List<StreamChangeRecord> snapshotChanges = computeChangelogBetweenStates(previousState, newState);
+                allChanges.addAll(snapshotChanges);
+                
+                // Update tracking ID
+                currentTrackingId = newSnapshot.getId();
+            }
+            
+            // Update the last read snapshot ID to the latest processed
+            this.lastReadSnapshotId = currentTrackingId;
+            
+            System.out.println("Computed total of " + allChanges.size() + " changelog records");
+            return allChanges;
+            
+        } finally {
+            tableLock.readLock().unlock();
+        }
+    }
+    
+    /**
+     * Gets a specific snapshot by ID
+     */
+    private Snapshot getSnapshotById(long snapshotId) throws IOException {
+        List<Snapshot> allSnapshots = snapshotManager.getAllSnapshots();
+        return allSnapshots.stream()
+            .filter(snapshot -> snapshot.getId() == snapshotId)
+            .findFirst()
+            .orElse(null);
+    }
+    
+    /**
+     * Computes changelog operations between two table states
+     * Returns records with appropriate change types: +I, -U, +U, -D
+     */
+    private List<StreamChangeRecord> computeChangelogBetweenStates(
+            List<Map<String, Object>> previousState, 
+            List<Map<String, Object>> newState) {
+        
+        List<StreamChangeRecord> changes = new ArrayList<>();
+        
+        // Convert states to maps keyed by primary key for efficient lookup
+        Map<String, Map<String, Object>> previousByKey = new HashMap<>();
+        Map<String, Map<String, Object>> newByKey = new HashMap<>();
+        
+        // Build previous state map
+        for (Map<String, Object> record : previousState) {
+            String key = buildPrimaryKey(record);
+            if (key != null) {
+                previousByKey.put(key, record);
+            }
+        }
+        
+        // Build new state map  
+        for (Map<String, Object> record : newState) {
+            String key = buildPrimaryKey(record);
+            if (key != null) {
+                newByKey.put(key, record);
+            }
+        }
+        
+        // Determine what changes occurred
+        Set<String> allKeys = new HashSet<>();
+        allKeys.addAll(previousByKey.keySet());
+        allKeys.addAll(newByKey.keySet());
+        
+        for (String key : allKeys) {
+            Map<String, Object> previousRecord = previousByKey.get(key);
+            Map<String, Object> newRecord = newByKey.get(key);
+            
+            if (previousRecord == null && newRecord != null) {
+                // INSERT (+I) - Record exists in new state but not in previous
+                changes.add(new StreamChangeRecord(StreamChangeType.INSERT, newRecord, null));
+                System.out.println("  Changelog: INSERT record with key: " + key);
+                
+            } else if (previousRecord != null && newRecord == null) {
+                // DELETE (-D) - Record exists in previous state but not in new
+                changes.add(new StreamChangeRecord(StreamChangeType.DELETE, null, previousRecord));
+                System.out.println("  Changelog: DELETE record with key: " + key);
+                
+            } else if (previousRecord != null && newRecord != null) {
+                // Both exist - check if they're different (UPDATE) or same
+                if (!recordsEqual(previousRecord, newRecord)) {
+                    // UPDATE (-U, +U) - Record changed between states
+                    changes.add(new StreamChangeRecord(StreamChangeType.UPDATE_BEFORE, null, previousRecord));  // -U
+                    changes.add(new StreamChangeRecord(StreamChangeType.UPDATE_AFTER, newRecord, null));        // +U
+                    System.out.println("  Changelog: UPDATE record with key: " + key);
+                }
+                // If records are equal, no change needed
+            }
+        }
+        
+        return changes;
+    }
+    
+    /**
+     * Builds primary key from record for comparison purposes
+     */
+    private String buildPrimaryKey(Map<String, Object> record) {
+        if (record == null || primaryKeyFields.isEmpty()) {
+            return null;
+        }
+        
+        StringBuilder keyBuilder = new StringBuilder();
+        for (String field : primaryKeyFields) {
+            Object value = record.get(field);
+            if (value != null) {
+                if (keyBuilder.length() > 0) {
+                    keyBuilder.append("|");
+                }
+                keyBuilder.append(value.toString());
+            }
+        }
+        return keyBuilder.length() > 0 ? keyBuilder.toString() : null;
     }
 }

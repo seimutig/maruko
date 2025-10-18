@@ -2,17 +2,17 @@ package org.example.tablestore.core;
 
 import org.example.tablestore.format.ManifestEntry;
 import org.example.tablestore.format.Snapshot;
-import org.example.tablestore.io.FileStore;
+import org.example.tablestore.io.IFileStore;
 
 import java.io.IOException;
 import java.util.*;
 
 public class MergeOnReadManager {
-    private final FileStore fileStore;
+    private final IFileStore fileStore;
     private final List<String> primaryKeyFields;
     private final Object mergeLock = new Object(); // Simple lock for merge operations
 
-    public MergeOnReadManager(FileStore fileStore, List<String> primaryKeyFields) {
+    public MergeOnReadManager(IFileStore fileStore, List<String> primaryKeyFields) {
         if (fileStore == null) {
             throw new IllegalArgumentException("FileStore cannot be null");
         }

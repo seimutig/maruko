@@ -3,18 +3,18 @@ package org.example.tablestore.compaction;
 import org.example.tablestore.core.MergeOnReadManager;
 import org.example.tablestore.format.ManifestEntry;
 import org.example.tablestore.format.ManifestManager;
-import org.example.tablestore.io.FileStore;
+import org.example.tablestore.io.IFileStore;
 
 import java.io.IOException;
 import java.util.*;
 
 public class CompactionManager {
-    private FileStore fileStore;
+    private IFileStore fileStore;
     private ManifestManager manifestManager;
     private MergeOnReadManager mergeManager;
     private int maxFileSizeThreshold; // in bytes
 
-    public CompactionManager(FileStore fileStore, ManifestManager manifestManager, 
+    public CompactionManager(IFileStore fileStore, ManifestManager manifestManager, 
                            MergeOnReadManager mergeManager) {
         this.fileStore = fileStore;
         this.manifestManager = manifestManager;

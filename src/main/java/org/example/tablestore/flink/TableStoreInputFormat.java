@@ -49,6 +49,10 @@ public class TableStoreInputFormat implements InputFormat<RowData, InputSplit>, 
     }
     
     public TableStoreInputFormat(String tablePath, List<String> primaryKeyFields) {
+        this(tablePath, primaryKeyFields, null); // Call new constructor with null options
+    }
+    
+    public TableStoreInputFormat(String tablePath, List<String> primaryKeyFields, Map<String, String> options) {
         this.tablePath = tablePath;
         this.primaryKeyFields = primaryKeyFields != null ? primaryKeyFields : java.util.Collections.emptyList();
         this.lastReadSnapshotId = -1;
@@ -295,82 +299,50 @@ public class TableStoreInputFormat implements InputFormat<RowData, InputSplit>, 
                     break; // Exit the loop if tableStore is null
                 }
                 
-                // Read change records since last read (this now captures INSERT, UPDATE, DELETE)
-                List<TableStore.ChangeRecord> changeRecords = tableStore.readChangeRecords();
+                // For streaming, try to read the latest data from tablestore
+                // Since persistent changelog is removed from sink, we'll check for new data differently
+                List<Map<String, Object>> allRecords = null;
+                try {
+                    allRecords = tableStore.read();
+                } catch (Exception e) {
+                    System.err.println("Error reading from TableStore: " + e.getMessage());
+                    // Continue the loop even if there's an error
+                }
                 
-                if (changeRecords != null && !changeRecords.isEmpty()) {
-                    System.out.println("Detected " + changeRecords.size() + " change records, emitting to stream...");
+                if (allRecords != null && !allRecords.isEmpty()) {
+                    System.out.println("Detected " + allRecords.size() + " records, emitting to stream...");
                     
-                    for (TableStore.ChangeRecord changeRecord : changeRecords) {
+                    for (Map<String, Object> record : allRecords) {
                         if (!isRunning) {
                             break;
                         }
                         
-                        // Get the appropriate record based on change type
-                        Map<String, Object> recordToProcess = null;
-                        String changeType = changeRecord.getChangeType().toString();
-                        
-                        if (changeRecord.getChangeType() == TableStore.ChangeType.DELETE) {
-                            // For DELETE, we should emit a delete marker or handle differently
-                            // For Flink changelog, we should properly mark this as a delete operation
-                            recordToProcess = changeRecord.getOldValue();
-                            System.out.println("Processing DELETE operation for record with key: " + 
-                                (recordToProcess != null ? recordToProcess.get(primaryKeyFields.get(0)) : "unknown"));
-                            
-                            // For DELETE operations, we need special handling
-                            if (recordToProcess != null && rowType != null) {
-                                try {
-                                    // In a real implementation, we might need to mark this as a DELETE record
-                                    // For now, we'll still convert it but acknowledge it's a DELETE
-                                    MapToRowDataConverter converter = new MapToRowDataConverter(rowType);
-                                    if (converter != null) {
-                                        RowData rowData = converter.convert(recordToProcess);
-                                        if (rowData != null) {
-                                            // In a proper implementation, we would mark this as a delete operation
-                                            // But for now, we'll just emit it and make note in logs
-                                            synchronized (ctx.getCheckpointLock()) {
-                                                ctx.collect(rowData); // This is where we'd apply special delete logic
-                                            }
-                                        }
-                                    }
-                                } catch (Exception e) {
-                                    System.err.println("Error converting DELETE record: " + e.getMessage());
-                                    e.printStackTrace();
-                                }
-                            }
-                        } else {
-                            // For INSERT or UPDATE, emit the new record
-                            recordToProcess = changeRecord.getNewValue();
-                            System.out.println("Processing " + changeType + " operation for record with key: " + 
-                                (recordToProcess != null ? recordToProcess.get(primaryKeyFields.get(0)) : "unknown"));
-                            
-                            // Convert Map<String, Object> to RowData
-                            if (recordToProcess != null && rowType != null) {
-                                try {
-                                    // Add change type info to the record for Flink changelog
-                                    Map<String, Object> finalRecord = new java.util.HashMap<>(recordToProcess);
-                                    
-                                    // Check that MapToRowDataConverter class exists and is accessible
-                                    MapToRowDataConverter converter = new MapToRowDataConverter(rowType);
-                                    if (converter != null) {
-                                        RowData rowData = converter.convert(finalRecord);
-                                        if (rowData != null) {
-                                            synchronized (ctx.getCheckpointLock()) {
-                                                ctx.collect(rowData);
-                                            }
-                                        } else {
-                                            System.out.println("Warning: Converter returned null for record: " + finalRecord);
+                        // Convert Map<String, Object> to RowData
+                        if (record != null && rowType != null) {
+                            try {
+                                // Add change type info to the record for Flink changelog
+                                Map<String, Object> finalRecord = new java.util.HashMap<>(record);
+                                
+                                // Check that MapToRowDataConverter class exists and is accessible
+                                MapToRowDataConverter converter = new MapToRowDataConverter(rowType);
+                                if (converter != null) {
+                                    RowData rowData = converter.convert(finalRecord);
+                                    if (rowData != null) {
+                                        synchronized (ctx.getCheckpointLock()) {
+                                            ctx.collect(rowData);
                                         }
                                     } else {
-                                        System.out.println("Warning: MapToRowDataConverter is null for record: " + finalRecord);
+                                        System.out.println("Warning: Converter returned null for record: " + finalRecord);
                                     }
-                                } catch (Exception e) {
-                                    System.err.println("Error converting record: " + e.getMessage());
-                                    e.printStackTrace();
+                                } else {
+                                    System.out.println("Warning: MapToRowDataConverter is null for record: " + finalRecord);
                                 }
-                            } else if (recordToProcess != null) {
-                                System.out.println("Warning: rowType is null, cannot convert record: " + recordToProcess);
+                            } catch (Exception e) {
+                                System.err.println("Error converting record: " + e.getMessage());
+                                e.printStackTrace();
                             }
+                        } else if (record != null) {
+                            System.out.println("Warning: rowType is null, cannot convert record: " + record);
                         }
                     }
                     
@@ -381,7 +353,7 @@ public class TableStoreInputFormat implements InputFormat<RowData, InputSplit>, 
                         System.out.println("Updated last read snapshot ID to: " + lastReadSnapshotId);
                     }
                 } else {
-                    System.out.println("No new change records detected in this polling cycle, continuing...");
+                    System.out.println("No new records detected in this polling cycle, continuing...");
                 }
                 
                 // Sleep for a while before checking for new data again

@@ -4,12 +4,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.hadoop.ParquetWriter;
-import org.apache.parquet.hadoop.api.WriteSupport;
-import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.hadoop.util.HadoopOutputFile;
 import org.apache.parquet.schema.MessageType;
-import org.apache.parquet.schema.Types;
-import org.apache.parquet.io.api.RecordConsumer;
 
 import java.io.IOException;
 import java.net.URI;
@@ -17,27 +13,64 @@ import java.util.List;
 import java.util.Map;
 import java.util.ArrayList;
 
-public class FileStore implements IFileStore {
+public class OSSCompatibleFileStore implements IFileStore {
     private String tablePath;
     private Configuration conf;
     private FileSystem fs;
     private MessageType schema;
 
-    public FileStore(String tablePath, MessageType schema) throws IOException {
+    public OSSCompatibleFileStore(String tablePath, MessageType schema) throws IOException {
+        this(tablePath, schema, null); // Call the new constructor with null options
+    }
+    
+    public OSSCompatibleFileStore(String tablePath, MessageType schema, Map<String, String> options) throws IOException {
         this.tablePath = tablePath;
         this.conf = new Configuration();
-        // Enable OSS support in Hadoop configuration
-        this.conf.set("fs.oss.impl", "org.apache.hadoop.fs.aliyun.oss.AliyunOSSFileSystem");
-        this.conf.set("fs.AbstractFileSystem.oss.impl", "org.apache.hadoop.fs.aliyun.oss.AliyunOSSFileSystem");
-        // Set additional OSS configurations
-        this.conf.set("fs.oss.endpoint", System.getProperty("oss.endpoint", "oss-cn-hangzhou.aliyuncs.com"));
-        this.conf.set("fs.oss.accessKeyId", System.getProperty("oss.accessKeyId", ""));
-        this.conf.set("fs.oss.accessKeySecret", System.getProperty("oss.accessKeySecret", ""));
         
-        // Set up the file system based on the tablePath scheme
+        // Configure for both local and OSS file systems
+        setupOSSConfiguration(options);
+        
+        // Determine the appropriate file system based on the path
         URI uri = URI.create(tablePath);
         this.fs = FileSystem.get(uri, conf);
         this.schema = schema;
+    }
+    
+    private void setupOSSConfiguration(Map<String, String> options) {
+        // OSS specific configurations
+        conf.set("fs.oss.impl", "org.apache.hadoop.fs.aliyun.oss.AliyunOSSFileSystem");
+        conf.set("fs.AbstractFileSystem.oss.impl", "org.apache.hadoop.fs.aliyun.oss.AliyunOSSFileSystem");
+        
+        // Get configuration from options first (highest priority)
+        String endpoint = null;
+        String accessKeyId = null;
+        String accessKeySecret = null;
+        
+        if (options != null) {
+            endpoint = options.get("oss.endpoint");
+            accessKeyId = options.get("oss.accessKeyId");
+            accessKeySecret = options.get("oss.accessKeySecret");
+        }
+        
+        // Fall back to system properties if not in options
+        if (endpoint == null || endpoint.isEmpty()) {
+            endpoint = System.getProperty("oss.endpoint", 
+                System.getenv("OSS_ENDPOINT") != null ? System.getenv("OSS_ENDPOINT") : "oss-cn-hangzhou.aliyuncs.com");
+        }
+        if (accessKeyId == null || accessKeyId.isEmpty()) {
+            accessKeyId = System.getProperty("oss.accessKeyId", 
+                System.getenv("OSS_ACCESS_KEY_ID") != null ? System.getenv("OSS_ACCESS_KEY_ID") : "");
+        }
+        if (accessKeySecret == null || accessKeySecret.isEmpty()) {
+            accessKeySecret = System.getProperty("oss.accessKeySecret", 
+                System.getenv("OSS_ACCESS_KEY_SECRET") != null ? System.getenv("OSS_ACCESS_KEY_SECRET") : "");
+        }
+        
+        if (!accessKeyId.isEmpty() && !accessKeySecret.isEmpty()) {
+            conf.set("fs.oss.endpoint", endpoint);
+            conf.set("fs.oss.accessKeyId", accessKeyId);
+            conf.set("fs.oss.accessKeySecret", accessKeySecret);
+        }
     }
 
     public String writeData(List<Map<String, Object>> records, Map<String, String> partitionSpec, int bucket) 
@@ -52,8 +85,7 @@ public class FileStore implements IFileStore {
             fs.mkdirs(bucketDir);
         }
 
-        // Sort records by primary key (assuming 'id' is primary key) and sequence number before writing
-        // In a real implementation, we'd extract the primary key fields from the table configuration
+        // Sort records by primary key and sequence number before writing
         List<Map<String, Object>> sortedRecords = new ArrayList<>(records);
         sortedRecords.sort((record1, record2) -> {
             // Extract primary key - assuming 'id' is the primary key field

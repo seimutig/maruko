@@ -1,0 +1,17 @@
+target/
+# Maven
+!target/README.md
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
