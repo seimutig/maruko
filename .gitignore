@@ -1,0 +1,48 @@
+# Maven
+target/
+dependency-reduced-pom.xml
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*_00*
+*.java_00*
+*.java.bak
+*.java.backup*
+
+# Class files
+*.class
+
+# Test classes
+target/test-classes/
+classpath.txt
+test_file.java
+test_flinksql_scenario.java
+
+# All test files in main source
+src/main/java/org/example/maruko/*Test*.java
+src/main/java/org/example/maruko/*Test*.class
+src/main/java/org/example/tablestore/*Test*.java
+src/main/java/org/example/tablestore/*Test*.class
+
+# Specific OSS Test files
+src/main/java/org/example/maruko/TestDataGenerationJobOss.java
+src/main/java/org/example/maruko/TestDataStreamJob1Oss.java
+src/main/java/org/example/tablestore/TestOSSStorage.java
+src/main/java/org/example/tablestore/TestOSSStorageFunctionality.java
+
+# Test files in src/test
+src/test/java/**/*Test*.java
+src/test/java/**/*Test*.class

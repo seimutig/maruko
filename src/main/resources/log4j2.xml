@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration status="WARN">
+    <appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+        </Console>
+    </appenders>
+    
+    <loggers>
+        <!-- Root logger -->
+        <root level="INFO">
+            <appender-ref ref="Console"/>
+        </root>
+        
+        <!-- Maruko logger - set to INFO by default -->
+        <Logger name="org.example.maruko" level="INFO" additivity="false">
+            <appender-ref ref="Console"/>
+        </Logger>
+        
+        <!-- Flink loggers - set to WARN to reduce noise -->
+        <Logger name="org.apache.flink" level="WARN" additivity="false">
+            <appender-ref ref="Console"/>
+        </Logger>
+        
+        <!-- Hadoop loggers - set to WARN to reduce noise -->
+        <Logger name="org.apache.hadoop" level="WARN" additivity="false">
+            <appender-ref ref="Console"/>
+        </Logger>
+        
+        <!-- Parquet loggers - set to WARN to reduce noise -->
+        <Logger name="org.apache.parquet" level="WARN" additivity="false">
+            <appender-ref ref="Console"/>
+        </Logger>
+    </loggers>
+</configuration>

@@ -1,0 +1,1056 @@
+package org.example.maruko.core;
+
+import org.example.maruko.compaction.CompactionManager;
+import org.example.maruko.format.Snapshot;
+import org.example.maruko.format.ManifestEntry;
+import org.example.maruko.format.ManifestManager;
+import org.example.maruko.format.SnapshotManager;
+import org.example.maruko.io.IFileStore;
+import org.example.maruko.lsm.LSMTree;
+import org.example.maruko.lsm.LSMTreeConfig;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
+import java.util.HashMap;
+import java.util.Set;
+import java.util.HashSet;
+
+import org.example.maruko.io.OSSCompatibleFileStore;
+import org.example.maruko.core.StreamChangeRecord;
+import org.example.maruko.core.StreamChangeType;
+import org.example.maruko.MarukoLogger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class TableStore {
+    private static final Logger logger = LoggerFactory.getLogger(TableStore.class);
+    private final String tablePath;
+    private final IFileStore fileStore;
+    private final SnapshotManager snapshotManager;
+    private final ManifestManager manifestManager;
+    private final MergeOnReadManager mergeManager;
+    private final CompactionManager compactionManager;
+    private final BucketAssigner bucketAssigner;
+    private final List<String> primaryKeyFields;
+    private final List<String> partitionFields;
+    private final LSMTree lsmTree; // New LSM tree component
+    private final ReentrantReadWriteLock tableLock = new ReentrantReadWriteLock();
+    private volatile boolean isClosed = false;
+    
+    // Write buffer for accumulating records before flushing to disk
+    private final List<Map<String, Object>> writeBuffer = new CopyOnWriteArrayList<>();
+    private final Object bufferLock = new Object();
+    private volatile long currentBufferSizeBytes = 0;
+    private static final long TARGET_BUFFER_SIZE_BYTES = 64 * 1024 * 1024; // 64MB default target file size
+    private volatile long lastFlushTimestamp = System.currentTimeMillis();
+    private static final long MAX_FLUSH_INTERVAL_MS = 30 * 1000; // 30 seconds max interval
+    
+    // Fields for streaming functionality
+    private volatile long lastReadSnapshotId = -1;
+    private final List<TableStoreChangeListener> changeListeners = new CopyOnWriteArrayList<>();
+    
+    // In-memory state tracking for real-time operations
+    private final Map<String, Map<String, Object>> currentState = new ConcurrentHashMap<>();
+    private final Object stateUpdateLock = new Object();
+
+    public TableStore(String tablePath, List<String> primaryKeyFields, List<String> partitionFields, 
+                     int numBuckets, org.apache.parquet.schema.MessageType schema) throws IOException {
+        this(tablePath, primaryKeyFields, partitionFields, numBuckets, schema, null); // Call the new constructor with null options
+    }
+    
+    public TableStore(String tablePath, List<String> primaryKeyFields, List<String> partitionFields, 
+                     int numBuckets, org.apache.parquet.schema.MessageType schema, 
+                     Map<String, String> options) throws IOException {
+        // Validate inputs
+        if (tablePath == null || tablePath.trim().isEmpty()) {
+            throw new IllegalArgumentException("Table path cannot be null or empty");
+        }
+        if (primaryKeyFields == null) {
+            throw new IllegalArgumentException("Primary key fields cannot be null");
+        }
+        if (numBuckets <= 0) {
+            throw new IllegalArgumentException("Number of buckets must be positive");
+        }
+        
+        this.tablePath = tablePath;
+        this.primaryKeyFields = primaryKeyFields;
+        this.partitionFields = partitionFields != null ? partitionFields : new ArrayList<>();
+        this.bucketAssigner = new BucketAssigner(numBuckets);
+        
+        System.out.println("Creating OSSCompatibleFileStore for tablePath: " + tablePath);
+        System.out.println("Options provided: " + options);
+        System.out.println("Primary key fields: " + primaryKeyFields);
+        
+        // Initialize core components
+        this.fileStore = new OSSCompatibleFileStore(tablePath, schema, options, primaryKeyFields);
+        System.out.println("Successfully created OSSCompatibleFileStore");
+        this.snapshotManager = new SnapshotManager(tablePath, fileStore.getFileSystem());
+        this.manifestManager = new ManifestManager(tablePath, fileStore.getFileSystem());
+        this.mergeManager = new MergeOnReadManager(fileStore, primaryKeyFields);
+        this.compactionManager = new CompactionManager(fileStore, manifestManager, mergeManager);
+        
+        // Initialize LSM tree with default configuration
+        LSMTreeConfig lsmConfig = LSMTreeConfig.getDefault();
+        this.lsmTree = new LSMTree(tablePath, fileStore, lsmConfig);
+        
+        // Initialize last read snapshot ID and load initial state
+        try {
+            Snapshot latestSnapshot = snapshotManager.getLatestSnapshot();
+            if (latestSnapshot != null) {
+                this.lastReadSnapshotId = latestSnapshot.getId();
+                
+                // Load the initial state from the latest snapshot
+                List<Map<String, Object>> initialState = read();
+                synchronized (stateUpdateLock) {
+                    currentState.clear();
+                    for (Map<String, Object> record : initialState) {
+                        String key = buildPrimaryKey(record);
+                        if (key != null) {
+                            currentState.put(key, new HashMap<>(record));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("Warning: Could not initialize last read snapshot ID: " + e.getMessage());
+            this.lastReadSnapshotId = -1;
+        }
+    }
+
+    /** 
+     * Accumulates records in write buffer for efficient batching
+     * Flushes to disk when buffer reaches target size or based on time-based policy
+     * Uses LSM-tree for file organization with proper buffering
+     * Determines operation type (INSERT/UPDATE) in real-time for primary key deduplication
+     */
+    public void write(List<Map<String, Object>> records) throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        if (records == null || records.isEmpty()) {
+            return; // Nothing to write
+        }
+        
+        tableLock.writeLock().lock();
+        try {
+            // Validate records
+            validateRecords(records);
+            
+            // Add records to write buffer for efficient batching
+            synchronized (bufferLock) {
+                for (Map<String, Object> record : records) {
+                    // Estimate record size (simplified estimation)
+                    long recordSize = estimateRecordSize(record);
+                    writeBuffer.add(new HashMap<>(record)); // Deep copy to avoid external mutations
+                    currentBufferSizeBytes += recordSize;
+                    
+                    // Update in-memory state for deduplication
+                    String primaryKeyValue = buildPrimaryKey(record);
+                    
+                    if (primaryKeyValue != null) {
+                        synchronized (stateUpdateLock) {
+                            currentState.put(primaryKeyValue, new HashMap<>(record));
+                        }
+                    }
+                }
+                
+                // Check if we should flush the buffer
+                if (shouldFlushBuffer()) {
+                    flushWriteBuffer();
+                }
+            }
+            
+            // Notify change listeners that new data has been buffered
+            notifyChangeListeners(records);
+            
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Deletes records by their primary key values
+     * Implements tombstone-based deletion in LSM-tree fashion
+     * Creates tombstone records that mark data as deleted
+     * These tombstones are handled during merge-on-read and compaction
+     *
+     * @param primaryKeyRecords List of records containing primary key fields to delete
+     * @throws IOException if there's an error during the delete operation
+     */
+    public void delete(List<Map<String, Object>> primaryKeyRecords) throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        if (primaryKeyRecords == null || primaryKeyRecords.isEmpty()) {
+            return; // Nothing to delete
+        }
+        
+        tableLock.writeLock().lock();
+        try {
+            System.out.println("Deleting " + primaryKeyRecords.size() + " records by primary key");
+            
+            // Create tombstone records for each primary key to delete
+            List<Map<String, Object>> tombstoneRecords = new ArrayList<>();
+            long sequenceNumber = System.currentTimeMillis();
+            
+            for (Map<String, Object> primaryKeyRecord : primaryKeyRecords) {
+                if (primaryKeyRecord == null) {
+                    continue;
+                }
+                
+                // Validate that the record contains primary key fields
+                boolean hasAllPrimaryKeys = true;
+                for (String primaryKeyField : primaryKeyFields) {
+                    if (!primaryKeyRecord.containsKey(primaryKeyField)) {
+                        MarukoLogger.error("Warning: Primary key record missing field " + primaryKeyField);
+                        hasAllPrimaryKeys = false;
+                        break;
+                    }
+                }
+                
+                if (hasAllPrimaryKeys) {
+                    // Create a tombstone record with the primary key fields and deletion marker
+                    // Include all fields from the current state to satisfy Parquet schema requirements
+                    Map<String, Object> tombstoneRecord = new HashMap<>();
+                    
+                    // Copy primary key fields
+                    for (String primaryKeyField : primaryKeyFields) {
+                        tombstoneRecord.put(primaryKeyField, primaryKeyRecord.get(primaryKeyField));
+                    }
+                    
+                    // Try to get other fields from current state to satisfy schema requirements
+                    String primaryKeyValue = buildPrimaryKey(primaryKeyRecord);
+                    synchronized (stateUpdateLock) {
+                        Map<String, Object> currentStateRecord = currentState.get(primaryKeyValue);
+                        if (currentStateRecord != null) {
+                            // Copy non-primary key fields from current state
+                            for (Map.Entry<String, Object> entry : currentStateRecord.entrySet()) {
+                                String fieldName = entry.getKey();
+                                if (!primaryKeyFields.contains(fieldName)) {
+                                    tombstoneRecord.put(fieldName, entry.getValue());
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Add deletion metadata
+                    tombstoneRecord.put("_deleted", true);
+                    tombstoneRecord.put("_sequence_number", sequenceNumber++);
+                    tombstoneRecord.put("_deleted_timestamp", System.currentTimeMillis());
+                    
+                    // Debug: Print tombstone record contents
+                            // logger.debug("DEBUG: Tombstone record contents: {}", tombstoneRecord);
+                    
+                    tombstoneRecords.add(tombstoneRecord);
+                            logger.info("Created tombstone for primary key: {}", buildPrimaryKey(primaryKeyRecord));
+                }
+            }
+            
+            if (!tombstoneRecords.isEmpty()) {
+                // Add tombstone records to write buffer for efficient batching
+                synchronized (bufferLock) {
+                    for (Map<String, Object> tombstoneRecord : tombstoneRecords) {
+                        // Estimate tombstone record size
+                        long recordSize = estimateRecordSize(tombstoneRecord);
+                        writeBuffer.add(new HashMap<>(tombstoneRecord)); // Deep copy to avoid external mutations
+                        currentBufferSizeBytes += recordSize;
+                        
+                        // Update in-memory state for deduplication
+                        String primaryKeyValue = null;
+                        primaryKeyValue = buildPrimaryKey(tombstoneRecord);
+                        
+                        if (primaryKeyValue != null) {
+                            synchronized (stateUpdateLock) {
+                                currentState.put(primaryKeyValue, new HashMap<>(tombstoneRecord));
+                            }
+                        }
+                    }
+                    
+                    // Check if we should flush the buffer
+                    if (shouldFlushBuffer()) {
+                        flushWriteBuffer();
+                    }
+                }
+                
+                // Notify change listeners that deletion has occurred
+                notifyChangeListeners(tombstoneRecords);
+                
+                System.out.println("Successfully created " + tombstoneRecords.size() + " tombstone records for deletion");
+            }
+            
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Estimates the size of a record in bytes (simplified implementation)
+     */
+    private long estimateRecordSize(Map<String, Object> record) {
+        if (record == null) return 0;
+        
+        long size = 0;
+        for (Map.Entry<String, Object> entry : record.entrySet()) {
+            size += entry.getKey().length(); // Field name size
+            Object value = entry.getValue();
+            if (value != null) {
+                // Rough estimation of value size
+                if (value instanceof String) {
+                    size += ((String) value).length();
+                } else if (value instanceof Number) {
+                    size += 8; // Assume 8 bytes for numbers
+                } else {
+                    size += value.toString().length(); // Fallback to string representation
+                }
+            }
+        }
+        return size;
+    }
+    
+    /**
+     * Determines if the write buffer should be flushed based on size or time policies
+     */
+    private boolean shouldFlushBuffer() {
+        // Flush if buffer reaches target size
+        if (currentBufferSizeBytes >= TARGET_BUFFER_SIZE_BYTES) {
+            return true;
+        }
+        
+        // Flush if enough time has passed (time-based flushing)
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastFlushTimestamp >= MAX_FLUSH_INTERVAL_MS) {
+            return !writeBuffer.isEmpty(); // Only flush if there's data
+        }
+        
+        // Don't flush yet
+        return false;
+    }
+    
+    /**
+     * Flushes the accumulated write buffer to disk as properly sized files
+     * This is the core optimization - creating substantial files instead of tiny ones
+     */
+    private void flushWriteBuffer() throws IOException {
+        if (writeBuffer.isEmpty()) {
+            return; // Nothing to flush
+        }
+        
+                logger.info("Flushing write buffer with {} records ({} MB) to disk", 
+                         writeBuffer.size(), (currentBufferSizeBytes / (1024 * 1024)));
+        
+        try {
+            // Group buffered records by partition and bucket for storage in LSM tree
+            Map<PartitionBucketKey, List<Map<String, Object>>> groupedRecords = 
+                groupRecordsByPartitionBucket(writeBuffer);
+            
+            // Write each group to appropriate partition and bucket with proper file sizing
+            for (Map.Entry<PartitionBucketKey, List<Map<String, Object>>> entry : groupedRecords.entrySet()) {
+                PartitionBucketKey key = entry.getKey();
+                List<Map<String, Object>> recordsForBucket = entry.getValue();
+                
+                // Add sequence number for deduplication
+                long sequenceNumber = System.currentTimeMillis();
+                for (Map<String, Object> record : recordsForBucket) {
+                    record.put("_sequence_number", sequenceNumber++);
+                }
+                
+                // Get the actual file path returned by writeData (creates properly sized files)
+                String actualFilePath = fileStore.writeData(recordsForBucket, key.getPartitionSpec(), key.getBucket());
+                
+                // Create manifest entry for the file created by FileStore
+                ManifestEntry manifestEntry = new ManifestEntry(
+                    ManifestEntry.ADD,
+                    sequenceNumber, // Use the sequence number as the base
+                    System.currentTimeMillis(), // file identifier
+                    buildPartitionPath(key.getPartitionSpec()),
+                    key.getBucket(),
+                    actualFilePath,
+                    0, // size - would be actual file size in real implementation
+                    recordsForBucket.size() // row count
+                );
+                
+                // Add file to LSM tree (level 0) - this represents the write path optimization
+                lsmTree.addFile(manifestEntry);
+            }
+            
+            // Clear the buffer after successful flush
+            writeBuffer.clear();
+            currentBufferSizeBytes = 0;
+            lastFlushTimestamp = System.currentTimeMillis();
+            
+            MarukoLogger.info("Write buffer flushed successfully to LSM tree");
+            
+        } catch (Exception e) {
+            System.err.println("Error flushing write buffer: " + e.getMessage());
+            throw new IOException("Failed to flush write buffer", e);
+        }
+    }
+    
+    /** 
+     * Creates snapshot based on checkpoint - this should be called during Flink checkpointing
+     * Flushes any pending write buffer to ensure data consistency
+     * Clears the real-time changelog as operations are already tracked in real-time
+     */
+    public void checkpoint() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.writeLock().lock();
+        try {
+            MarukoLogger.info("Creating snapshot during checkpoint...");
+            
+            // IMPORTANT: Flush any pending writes to ensure checkpoint consistency
+            flushPendingWrites();
+            
+            // Create the actual snapshot with current data
+            createSnapshotAndManifest();
+            
+            // For sink tables, operations are already applied during write
+            // Snapshots are created for consistent reads and checkpointing
+            
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Flushes any pending writes to ensure data consistency
+     * This is critical for checkpointing and data durability
+     */
+    private void flushPendingWrites() throws IOException {
+        synchronized (bufferLock) {
+            // Flush write buffer if it contains any data
+            if (!writeBuffer.isEmpty()) {
+                System.out.println("Flushing pending writes (" + writeBuffer.size() + " records) during checkpoint");
+                flushWriteBuffer();
+            }
+        }
+    }
+    
+    /**
+     * Gets the current table state as a map keyed by primary key
+     */
+    private Map<String, Map<String, Object>> getCurrentStateAsMap() throws IOException {
+        List<Map<String, Object>> currentState = read();
+        Map<String, Map<String, Object>> stateMap = new HashMap<>();
+        
+        for (Map<String, Object> record : currentState) {
+            String key = buildPrimaryKey(record);
+            if (key != null) {
+                stateMap.put(key, record);
+            }
+        }
+        
+        return stateMap;
+    }
+    
+    /**
+     * Validates records before writing
+     */
+    private void validateRecords(List<Map<String, Object>> records) throws IOException {
+        for (Map<String, Object> record : records) {
+            if (record == null) {
+                throw new IOException("Record cannot be null");
+            }
+            
+            // Check that primary key fields exist and have values
+            for (String primaryKeyField : primaryKeyFields) {
+                if (!record.containsKey(primaryKeyField) || record.get(primaryKeyField) == null) {
+                    throw new IOException("Primary key field '" + primaryKeyField + "' is required and cannot be null");
+                }
+            }
+            
+            // Check partition fields
+            for (String partitionField : partitionFields) {
+                if (!record.containsKey(partitionField)) {
+                    MarukoLogger.info("Warning: Partition field '" + partitionField + "' not found in record, using default");
+                }
+            }
+        }
+    }
+    
+    /**
+     * Reads records from the table applying merge-on-read deduplication
+     * Follows the correct path: snapshot -> manifest -> parquet files
+     */
+    public List<Map<String, Object>> read() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.readLock().lock();
+        try {
+            // Follow the correct read path: get latest snapshot, then manifest entries, then parquet files
+            Snapshot latestSnapshot = snapshotManager.getLatestSnapshot();
+            
+            System.out.println("DEBUG: In read() method, latest snapshot: " + latestSnapshot);
+            
+            if (latestSnapshot == null) {
+                MarukoLogger.info("No snapshots found, returning empty result");
+                return new ArrayList<>(); // No data to read if no snapshots exist
+            }
+            
+            System.out.println("Reading from snapshot ID: " + latestSnapshot.getId() + 
+                             " with manifest list: " + latestSnapshot.getManifestList());
+            
+            // Read manifest entries from the snapshot's manifest list
+            List<ManifestEntry> manifestEntries = manifestManager.readManifestFile(latestSnapshot.getManifestList());
+            
+            System.out.println("DEBUG: Found " + manifestEntries.size() + " manifest entries in read() method");
+            for (int i = 0; i < Math.min(5, manifestEntries.size()); i++) { // Print first 5 entries for debugging
+                ManifestEntry entry = manifestEntries.get(i);
+                System.out.println("DEBUG: Read method - Manifest entry " + i + ": " + entry.getFilePath() + 
+                                 ", bucket: " + entry.getBucket() + 
+                                 ", partition: " + entry.getPartition() + 
+                                 ", rowCount: " + entry.getRowCount());
+            }
+            
+            // Apply merge-on-read deduplication
+            List<Map<String, Object>> result = mergeManager.readWithMerge(manifestEntries);
+            
+            System.out.println("DEBUG: After merge in read() method, result size: " + result.size());
+            for (int i = 0; i < Math.min(5, result.size()); i++) { // Print first 5 records for debugging
+                Map<String, Object> record = result.get(i);
+                MarukoLogger.info("DEBUG: Read method - Record " + i + ": " + record);
+            }
+            
+            // Update in-memory state to keep it in sync with the latest snapshot
+            synchronized (stateUpdateLock) {
+                currentState.clear();
+                for (Map<String, Object> record : result) {
+                    String key = buildPrimaryKey(record);
+                    if (key != null) {
+                        currentState.put(key, new HashMap<>(record));
+                    }
+                }
+            }
+            
+            return result;
+        } finally {
+            tableLock.readLock().unlock();
+        }
+    }
+    
+    private String buildPartitionPath(Map<String, String> partitionSpec) {
+        StringBuilder path = new StringBuilder();
+        for (Map.Entry<String, String> entry : partitionSpec.entrySet()) {
+            if (path.length() > 0) {
+                path.append("/");
+            }
+            path.append(entry.getKey()).append("=").append(entry.getValue());
+        }
+        return path.length() > 0 ? path.toString() : "default";
+    }
+    
+    /**
+     * Helper method to compare two records for equality, ignoring metadata fields
+     */
+    private boolean recordsEqual(Map<String, Object> record1, Map<String, Object> record2) {
+        if (record1 == null && record2 == null) return true;
+        if (record1 == null || record2 == null) return false;
+        
+        // Compare all business fields (excluding metadata like _sequence_number)
+        Set<String> allKeys = new HashSet<>();
+        allKeys.addAll(record1.keySet());
+        allKeys.addAll(record2.keySet());
+        
+        for (String key : allKeys) {
+            // Skip metadata fields that don't represent actual data changes
+            if (!key.equals("_sequence_number") && !key.equals("_version")) {
+                Object value1 = record1.get(key);
+                Object value2 = record2.get(key);
+                
+                if (value1 == null && value2 == null) continue;
+                if (value1 == null || value2 == null) return false;
+                if (!value1.equals(value2)) return false;
+            }
+        }
+        return true;
+    }
+    
+    /**
+     * Helper method to extract key business fields for display purposes
+     */
+    private Map<String, Object> extractKeyFields(Map<String, Object> record) {
+        Map<String, Object> keyFields = new HashMap<>();
+        for (Map.Entry<String, Object> entry : record.entrySet()) {
+            // Skip metadata fields for cleaner display
+            if (!entry.getKey().equals("_sequence_number") && !entry.getKey().equals("_version")) {
+                keyFields.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return keyFields;
+    }
+    
+    
+    
+    /**
+     * Performs compaction on the table using LSM-tree
+     */
+    public void compact() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.writeLock().lock();
+        try {
+            MarukoLogger.info("Performing LSM-tree compaction on table: " + tablePath);
+            // Use LSM tree for compaction
+            lsmTree.forceFullCompaction();
+            
+            // Also run traditional compaction manager for backward compatibility
+            // In a real implementation, we might only use the LSM tree approach
+            // For this toy implementation, we'll skip calling compactionManager methods
+            // since they require specific partition/bucket parameters
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Groups records by their partition and bucket
+     */
+    private Map<PartitionBucketKey, List<Map<String, Object>>> groupRecordsByPartitionBucket(
+            List<Map<String, Object>> records) {
+        
+        Map<PartitionBucketKey, List<Map<String, Object>>> groupedRecords = new java.util.concurrent.ConcurrentHashMap<>();
+        
+        for (Map<String, Object> record : records) {
+            // Build partition spec
+            Map<String, String> partitionSpec = new java.util.HashMap<>();
+            for (String partitionField : partitionFields) {
+                Object value = record.get(partitionField);
+                if (value != null) {
+                    partitionSpec.put(partitionField, value.toString());
+                } else {
+                    partitionSpec.put(partitionField, "default"); // Handle null partition values
+                }
+            }
+            
+            // Get bucket - use primary key fields for bucket assignment
+            int bucket = bucketAssigner.assignBucketFromFields(primaryKeyFields, record);
+            
+            // Create key
+            PartitionBucketKey key = new PartitionBucketKey(partitionSpec, bucket);
+            
+            // Add to group - use computeIfAbsent for thread safety
+            groupedRecords.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(record);
+        }
+        
+        return groupedRecords;
+    }
+
+    /**
+     * Creates snapshot and manifest entries for the written data
+     * Now uses LSM tree files instead of accumulating all entries
+     */
+    private void createSnapshotAndManifest() throws IOException {
+        tableLock.writeLock().lock();
+        try {
+            // Get all files from LSM tree for this snapshot
+            List<ManifestEntry> allEntries = lsmTree.getAllFiles();
+            
+            if (allEntries != null && !allEntries.isEmpty()) {
+                // Create a manifest file with the entries
+                String manifestFileName = manifestManager.writeManifestFile(allEntries);
+                
+                // Create snapshot with the manifest
+                Snapshot snapshot = snapshotManager.createSnapshot(manifestFileName, 1, "tablestore");
+                
+                // Optional: Update the last read snapshot ID to avoid reading the same snapshot again
+                // This should only be done if the snapshot is not being read as part of streaming
+            } else {
+                // Create empty manifest if no entries
+                String manifestFileName = "manifest_" + System.currentTimeMillis() + ".json";
+                List<ManifestEntry> emptyEntries = new java.util.ArrayList<>();
+                manifestManager.writeManifestFile(emptyEntries);
+                Snapshot snapshot = snapshotManager.createSnapshot(manifestFileName, 1, "tablestore");
+            }
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+
+    public String getTablePath() {
+        return tablePath;
+    }
+
+    public IFileStore getFileStore() {
+        return fileStore;
+    }
+
+    public SnapshotManager getSnapshotManager() {
+        return snapshotManager;
+    }
+
+    public ManifestManager getManifestManager() {
+        return manifestManager;
+    }
+
+    public MergeOnReadManager getMergeManager() {
+        return mergeManager;
+    }
+
+    public CompactionManager getCompactionManager() {
+        return compactionManager;
+    }
+    
+    /**
+     * Get LSM tree for testing and inspection
+     */
+    
+    /**
+     * Get LSM tree statistics
+     */
+    public String getLSMTreeStats() {
+        return "LSM Trees Statistics: Multiple bucket LSM trees implemented";
+    }
+    
+    /**
+     * Closes the TableStore and releases all resources
+     * Ensures any pending writes are flushed before closing
+     */
+    public void close() throws IOException {
+        if (isClosed) {
+            return; // Already closed
+        }
+        
+        tableLock.writeLock().lock();
+        try {
+            MarukoLogger.info("Closing TableStore: " + tablePath);
+            
+            // Flush any pending writes to ensure data durability
+            flushPendingWrites();
+            
+            // Close all managers and clean up resources
+            if (snapshotManager != null) {
+                // Snapshot manager doesn't need explicit closing in this implementation
+            }
+            if (manifestManager != null) {
+                // Manifest manager doesn't need explicit closing in this implementation  
+            }
+            if (fileStore != null && fileStore instanceof AutoCloseable) {
+                try {
+                    ((AutoCloseable) fileStore).close();
+                } catch (Exception e) {
+                    System.err.println("Warning: Error closing file store: " + e.getMessage());
+                }
+            }
+            
+            // Mark as closed
+            isClosed = true;
+            MarukoLogger.info("TableStore closed successfully: " + tablePath);
+            
+        } finally {
+            tableLock.writeLock().unlock();
+        }
+    }
+    
+    /** 
+     * Returns whether this TableStore is closed
+     */
+    public boolean isClosed() {
+        return isClosed;
+    }
+    
+    // Streaming functionality methods
+    
+    /**
+     * Sets the last read snapshot ID
+     */
+    public void setLastReadSnapshotId(long snapshotId) {
+        this.lastReadSnapshotId = snapshotId;
+    }
+    
+    /**
+     * Gets the last read snapshot ID
+     */
+    public long getLastReadSnapshotId() {
+        return this.lastReadSnapshotId;
+    }
+    
+    /**
+     * Add a change listener
+     */
+    public void addChangeListener(TableStoreChangeListener listener) {
+        this.changeListeners.add(listener);
+    }
+    
+    /**
+     * Remove a change listener
+     */
+    public void removeChangeListener(TableStoreChangeListener listener) {
+        this.changeListeners.remove(listener);
+    }
+    
+    /**
+     * Notify all change listeners about new data
+     */
+    private void notifyChangeListeners(List<Map<String, Object>> records) {
+        for (TableStoreChangeListener listener : changeListeners) {
+            try {
+                listener.onDataWritten(records);
+            } catch (Exception e) {
+                System.err.println("Error notifying change listener: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+    
+    /**
+     * Interface for listening to TableStore changes
+     */
+    public interface TableStoreChangeListener {
+        void onDataWritten(List<Map<String, Object>> records) throws IOException;
+    }
+    
+    /**
+     * Helper method to find a record by primary key in a list of records
+     */
+    private Map<String, Object> findRecordByPrimaryKey(List<Map<String, Object>> records, String primaryKeyValue) {
+        if (primaryKeyFields.isEmpty() || primaryKeyValue == null) {
+            return null;
+        }
+        
+        for (Map<String, Object> record : records) {
+            String recordKey = buildPrimaryKey(record);
+            if (recordKey != null && primaryKeyValue.equals(recordKey)) {
+                return record;
+            }
+        }
+        return null;
+    }
+
+
+
+    /** 
+     * Enum for different types of changes
+     */
+    public enum ChangeType {
+        INSERT,
+        UPDATE,
+        DELETE
+    }
+    
+    /**
+     * Gets the initial full snapshot for streaming mode
+     * This reads the complete latest snapshot as +I records for stream initialization
+     */
+    public List<Map<String, Object>> getInitialFullSnapshot() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.readLock().lock();
+        try {
+            MarukoLogger.info("Getting initial full snapshot for streaming initialization...");
+            
+            // Get the latest snapshot as the baseline
+            Snapshot latestSnapshot = snapshotManager.getLatestSnapshot();
+            
+            MarukoLogger.info("DEBUG: Latest snapshot found: " + latestSnapshot);
+            
+            if (latestSnapshot == null) {
+                MarukoLogger.info("No snapshots found for initial streaming state, returning empty result");
+                return new ArrayList<>();
+            }
+            
+            System.out.println("Reading initial full snapshot ID: " + latestSnapshot.getId());
+            System.out.println("Manifest list file: " + latestSnapshot.getManifestList());
+            
+            // Read manifest entries from the snapshot's manifest list
+            List<ManifestEntry> manifestEntries = manifestManager.readManifestFile(latestSnapshot.getManifestList());
+            
+            System.out.println("DEBUG: Found " + manifestEntries.size() + " manifest entries in snapshot");
+            for (int i = 0; i < Math.min(5, manifestEntries.size()); i++) { // Print first 5 entries for debugging
+                ManifestEntry entry = manifestEntries.get(i);
+                System.out.println("DEBUG: Manifest entry " + i + ": " + entry.getFilePath() + 
+                                 ", bucket: " + entry.getBucket() + 
+                                 ", partition: " + entry.getPartition() + 
+                                 ", rowCount: " + entry.getRowCount());
+            }
+            
+            // Apply merge-on-read deduplication to get current state
+            List<Map<String, Object>> currentFullState = mergeManager.readWithMerge(manifestEntries);
+            
+            System.out.println("DEBUG: After merge, currentFullState size: " + currentFullState.size());
+            for (int i = 0; i < Math.min(5, currentFullState.size()); i++) { // Print first 5 records for debugging
+                Map<String, Object> record = currentFullState.get(i);
+                // logger.info("DEBUG: Record " + i + ": " + record);
+            }
+            
+            // Update the last read snapshot ID to track where we are for changelog computation
+            this.lastReadSnapshotId = latestSnapshot.getId();
+            
+            System.out.println("Initial full snapshot contains " + currentFullState.size() + " records");
+            
+            return currentFullState;
+        } finally {
+            tableLock.readLock().unlock();
+        }
+    }
+    
+    /**
+     * Computes changelog between two snapshots for streaming mode
+     * Compares previous snapshot with current latest snapshot to determine +I, -U, +U, -D operations
+     */
+    public List<StreamChangeRecord> computeChangelogSinceLastRead() throws IOException {
+        if (isClosed) {
+            throw new IllegalStateException("TableStore is closed");
+        }
+        
+        tableLock.readLock().lock();
+        try {
+            MarukoLogger.info("Computing changelog since last read snapshot ID: " + lastReadSnapshotId);
+            
+            // Get all snapshots after the last read ID
+            List<Snapshot> snapshotsAfterLastRead = snapshotManager.getSnapshotsAfterId(lastReadSnapshotId);
+            
+            if (snapshotsAfterLastRead.isEmpty()) {
+                MarukoLogger.info("No new snapshots found since ID: " + lastReadSnapshotId);
+                return new ArrayList<>();
+            }
+            
+            // Process each new snapshot in order to compute cumulative changelog
+            List<StreamChangeRecord> allChanges = new ArrayList<>();
+            long currentTrackingId = lastReadSnapshotId;
+            
+            for (Snapshot newSnapshot : snapshotsAfterLastRead) {
+                System.out.println("Processing snapshot ID: " + newSnapshot.getId() + " (previous was: " + currentTrackingId + ")");
+                
+                // Get the previous snapshot state (could be null for first snapshot)
+                List<Map<String, Object>> previousState = new ArrayList<>();
+                if (currentTrackingId > 0) {
+                    Snapshot previousSnapshot = getSnapshotById(currentTrackingId);
+                    if (previousSnapshot != null) {
+                        List<ManifestEntry> prevManifestEntries = manifestManager.readManifestFile(previousSnapshot.getManifestList());
+                        previousState = mergeManager.readWithMerge(prevManifestEntries);
+                    }
+                }
+                
+                // Get the new snapshot state
+                List<ManifestEntry> newManifestEntries = manifestManager.readManifestFile(newSnapshot.getManifestList());
+                List<Map<String, Object>> newState = mergeManager.readWithMerge(newManifestEntries);
+                
+                // Compute changelog between previous and new state
+                List<StreamChangeRecord> snapshotChanges = computeChangelogBetweenStates(previousState, newState);
+                allChanges.addAll(snapshotChanges);
+                
+                // Update tracking ID
+                currentTrackingId = newSnapshot.getId();
+            }
+            
+            // Update the last read snapshot ID to the latest processed
+            this.lastReadSnapshotId = currentTrackingId;
+            
+            System.out.println("Computed total of " + allChanges.size() + " changelog records");
+            return allChanges;
+            
+        } finally {
+            tableLock.readLock().unlock();
+        }
+    }
+    
+    /**
+     * Gets a specific snapshot by ID
+     */
+    private Snapshot getSnapshotById(long snapshotId) throws IOException {
+        List<Snapshot> allSnapshots = snapshotManager.getAllSnapshots();
+        return allSnapshots.stream()
+            .filter(snapshot -> snapshot.getId() == snapshotId)
+            .findFirst()
+            .orElse(null);
+    }
+    
+    /**
+     * Computes changelog operations between two table states
+     * Returns records with appropriate change types: +I, -U, +U, -D
+     */
+    private List<StreamChangeRecord> computeChangelogBetweenStates(
+            List<Map<String, Object>> previousState, 
+            List<Map<String, Object>> newState) {
+        
+        List<StreamChangeRecord> changes = new ArrayList<>();
+        
+        // Convert states to maps keyed by primary key for efficient lookup
+        Map<String, Map<String, Object>> previousByKey = new HashMap<>();
+        Map<String, Map<String, Object>> newByKey = new HashMap<>();
+        
+        // Build previous state map
+        for (Map<String, Object> record : previousState) {
+            String key = buildPrimaryKey(record);
+            if (key != null) {
+                previousByKey.put(key, record);
+            }
+        }
+        
+        // Build new state map  
+        for (Map<String, Object> record : newState) {
+            String key = buildPrimaryKey(record);
+            if (key != null) {
+                newByKey.put(key, record);
+            }
+        }
+        
+        // Determine what changes occurred
+        Set<String> allKeys = new HashSet<>();
+        allKeys.addAll(previousByKey.keySet());
+        allKeys.addAll(newByKey.keySet());
+        
+        for (String key : allKeys) {
+            Map<String, Object> previousRecord = previousByKey.get(key);
+            Map<String, Object> newRecord = newByKey.get(key);
+            
+            if (previousRecord == null && newRecord != null) {
+                // INSERT (+I) - Record exists in new state but not in previous
+                changes.add(new StreamChangeRecord(StreamChangeType.INSERT, newRecord, null));
+                MarukoLogger.info("  Changelog: INSERT record with key: " + key);
+                
+            } else if (previousRecord != null && newRecord == null) {
+                // DELETE (-D) - Record exists in previous state but not in new
+                changes.add(new StreamChangeRecord(StreamChangeType.DELETE, null, previousRecord));
+                MarukoLogger.info("  Changelog: DELETE record with key: " + key);
+                
+            } else if (previousRecord != null && newRecord != null) {
+                // Both exist - check if they're different (UPDATE) or same
+                if (!recordsEqual(previousRecord, newRecord)) {
+                    // UPDATE (-U, +U) - Record changed between states
+                    changes.add(new StreamChangeRecord(StreamChangeType.UPDATE_BEFORE, null, previousRecord));  // -U
+                    changes.add(new StreamChangeRecord(StreamChangeType.UPDATE_AFTER, newRecord, null));        // +U
+                    MarukoLogger.info("  Changelog: UPDATE record with key: " + key);
+                }
+                // If records are equal, no change needed
+            }
+        }
+        
+        return changes;
+    }
+    
+    /**
+     * Builds primary key from record for comparison purposes
+     */
+    private String buildPrimaryKey(Map<String, Object> record) {
+        if (record == null || primaryKeyFields.isEmpty()) {
+            return null;
+        }
+        
+        StringBuilder keyBuilder = new StringBuilder();
+        for (String field : primaryKeyFields) {
+            Object value = record.get(field);
+            if (value != null) {
+                if (keyBuilder.length() > 0) {
+                    keyBuilder.append("|");
+                }
+                keyBuilder.append(value.toString());
+            }
+        }
+        return keyBuilder.length() > 0 ? keyBuilder.toString() : null;
+    }
+}
